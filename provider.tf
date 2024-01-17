@@ -30,6 +30,11 @@ variable "public_subnet" {
     default = ["192.168.0.0/24","192.168.1.0/24","192.168.2.0/24"]
 }
 
+variable "private_subnet" {
+    type = list(string)
+    default = ["192.168.10.0/24","192.168.11.0/24","192.168.12.0/24"]
+}
+
 # Configure the AWS Provider
 provider "aws" {
     profile = "dev"
@@ -56,6 +61,17 @@ resource "aws_subnet" "public" {
     }
 }
 
+resource "aws_subnet" "private" {
+    count = length(var.private_subnet)
+    vpc_id = aws_vpc.this.id
+    cidr_block = var.private_subnet[count.index]
+    availability_zone = var.azs[count.index]
+    
+    tags = {
+        Name = format("%s_%s_%s",local.owner,"PrivateSubnet",count.index)
+    }
+}
+
 resource "aws_internet_gateway" "this" {
     vpc_id = aws_vpc.this.id 
     tags = { 
@@ -63,6 +79,21 @@ resource "aws_internet_gateway" "this" {
     }  
 }
 
+
+resource "aws_eip" "nat_ip" {
+  domain = "vpc"
+}
+
+resource "aws_nat_gateway" "this" {
+  allocation_id = aws_eip.nat_ip.id
+  subnet_id     = aws_subnet.public[0].id
+
+  tags = {
+    Name = "gw NAT"
+  }
+
+  depends_on = [aws_internet_gateway.this]
+}
 
 resource "aws_route_table" "public" {
     vpc_id = aws_vpc.this.id
@@ -77,10 +108,29 @@ resource "aws_route_table" "public" {
     }
 }
 
+resource "aws_route_table" "private" {
+    vpc_id = aws_vpc.this.id
+
+    route {
+        cidr_block = "0.0.0.0/0"
+        gateway_id = aws_nat_gateway.this.id
+    }
+
+    tags = {
+        Name = format("%s_%s",local.owner,"PrivateRT")
+    }
+}
+
 resource "aws_route_table_association" "public" {
     count = length(var.public_subnet)
     subnet_id = aws_subnet.public[count.index].id
     route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+    count = length(var.private_subnet)
+    subnet_id = aws_subnet.private[count.index].id
+    route_table_id = aws_route_table.private.id
 }
 
 resource "aws_security_group" "eks" {
@@ -282,8 +332,9 @@ resource "aws_eks_node_group" "worker" {
   subnet_ids      = [aws_subnet.public[0].id,aws_subnet.public[1].id,aws_subnet.public[2].id] // Network Configuration
 
   // Worker Settings
-  instance_types = ["t3.micro"]
+  instance_types = ["t3.small"]
   disk_size      = 20
+  capacity_type = "ON_DEMAND" #OR SPOT
 
   scaling_config {
     desired_size = 1
@@ -296,28 +347,12 @@ resource "aws_eks_node_group" "worker" {
     ec2_ssh_key               = "keypair-DevCollie"
   }
 
-  # Ensure that IAM Role permissions are created before and deleted after EKS Node Group handling.
-  # Otherwise, EKS will not be able to properly delete EC2 Instances and Elastic Network Interfaces.
   depends_on = [
     aws_iam_role_policy_attachment.eks-worker-AmazonEC2ContainerRegistryReadOnly,
     aws_iam_role_policy_attachment.eks-worker-AmazonEKS_CNI_Policy,
     aws_iam_role_policy_attachment.eks-worker-AmazonEKSWorkerNodePolicy,
   ]
 }
-
-# resource "aws_launch_configuration" "worker" {
-#   associate_public_ip_address = true
-#   iam_instance_profile        = aws_iam_instance_profile.worker.name
-#   image_id                    = data.aws_ami.worker.id
-#   instance_type               = "t3.micro"
-#   name_prefix                 = "Collie_EKS"
-#   security_groups             = [aws_security_group.worker.id]
-#   user_data_base64            = base64encode(local.eks_worker_userdata)
-
-#   lifecycle {
-#     create_before_destroy = true
-#   }
-# }
 
 data "template_file" "aws-auth" {
   template = file("${path.module}/templates/aws_auth.yaml.tpl")
@@ -332,22 +367,108 @@ resource "local_file" "aws-auth" {
   filename = "${path.cwd}/.output/aws_auth.yaml"
 }
 
-# resource "aws_autoscaling_group" "worker" {
-#   desired_capacity     = 2
-#   launch_configuration = aws_launch_configuration.worker.name
-#   max_size             = 2
-#   min_size             = 1
-#   name                 = "Collie_EKS"
-#   vpc_zone_identifier  = [aws_subnet.public[0].id,aws_subnet.public[1].id,aws_subnet.public[2].id]
-#   tag {
-#     key                 = "Name"
-#     value               = "Collie_EKS"
-#     propagate_at_launch = true
-#   }
 
-#   tag {
-#     key                 = "kubernetes.io/cluster/Collie_EKS"
-#     value               = "owned"
-#     propagate_at_launch = true
-#   }
-# }
+
+data "aws_ami" "this" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "architecture"
+    values = ["arm64"]
+  }
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023*"]
+  }
+}
+
+resource "aws_instance" "bastion" {
+  ami = data.aws_ami.this.id
+  instance_market_options {
+    market_type = "spot"
+    spot_options {
+      max_price = 0.0031
+    }
+  }
+
+  subnet_id = aws_subnet.public[0].id
+  instance_type = "t4g.nano"
+  tags = {
+    Name = "test-spot"
+  }
+}
+
+resource "aws_eip" "ec2" {
+  domain = "vpc"
+  instance = aws_instance.bastion.id
+}
+
+resource "aws_db_subnet_group" "education" {
+  name       = "education"
+  subnet_ids = aws_subnet.public[*].id
+
+  tags = {
+    Name = "Education"
+  }
+}
+
+resource "aws_security_group" "rds" {
+  name   = "education_rds"
+  vpc_id = aws_vpc.this.id
+
+  ingress {
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "education_rds"
+  }
+}
+
+resource "aws_db_parameter_group" "education" {
+  name   = "education"
+  family = "postgres16"
+
+  parameter {
+    name  = "log_connections"
+    value = "1"
+  }
+}
+
+variable "db_password" {
+  description = "RDS root user password"
+  sensitive   = true
+}
+
+resource "aws_db_instance" "education" {
+  identifier             = "education"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 5
+  engine                 = "postgres"
+  engine_version         = "16.1"
+  username               = "edu"
+  password               = var.db_password
+  db_subnet_group_name   = aws_db_subnet_group.education.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  parameter_group_name   = aws_db_parameter_group.education.name
+  skip_final_snapshot    = true
+}
+
+# TO-DO Cloudfront resource 
+#https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudfront_distribution
+
+# TO-DO S3 resource
+#https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket
+
+# TO-DO SSM Setting
+#https://docs.aws.amazon.com/ko_kr/prescriptive-guidance/latest/patterns/connect-to-an-amazon-ec2-instance-by-using-session-manager.html
