@@ -1,4 +1,5 @@
 # kubectl install
+# tfenv use 1.5.6
 # terraform init
 # 
 
@@ -113,7 +114,7 @@ resource "aws_route_table" "private" {
 
     route {
         cidr_block = "0.0.0.0/0"
-        gateway_id = aws_nat_gateway.this.id
+        nat_gateway_id = aws_nat_gateway.this.id
     }
 
     tags = {
@@ -203,19 +204,26 @@ resource "aws_eks_cluster" "eks" {
     ]
 }
 
-data "template_file" "kube-config" {
-	template = file("${path.module}/templates/kube_config.yaml.tpl")
+# data "template_file" "kube-config" {
+# 	template = file("${path.module}/templates/kube_config.yaml.tpl")
 
-	vars = {
+	# vars = {
+	# 	CERTIFICATE = aws_eks_cluster.eks.certificate_authority[0].data
+	# 	MASTER_ENDPOINT = aws_eks_cluster.eks.endpoint
+	# 	CLUSTER_NAME = format("%s_%s",local.owner,"EKS")
+	# 	ROLE_ARN = aws_iam_role.eks.arn
+	# }
+# }
+
+resource "local_file" "kube_config" {
+ content = templatefile("${path.module}/templates/kube_config.yaml.tpl",
+    {
 		CERTIFICATE = aws_eks_cluster.eks.certificate_authority[0].data
 		MASTER_ENDPOINT = aws_eks_cluster.eks.endpoint
 		CLUSTER_NAME = format("%s_%s",local.owner,"EKS")
 		ROLE_ARN = aws_iam_role.eks.arn
-	}
-}
-
-resource "local_file" "kube_config" {
- content = data.template_file.kube-config.rendered
+	})
+ # content = data.template_file.kube-config.rendered
  filename = "${path.cwd}/.output/kube_config.yaml"
 }
 
@@ -308,6 +316,33 @@ resource "aws_security_group_rule" "eks_cluster_ingress_node_https" {
   type                     = "ingress"
 }
 
+resource "aws_security_group" "bastion" {
+  name        = "bastion"
+  description = "bastion"
+  vpc_id      = aws_vpc.this.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    "Name" = "bastion"
+  }
+}
+
+resource "aws_security_group_rule" "ssh" {
+  description              = "test"
+  cidr_blocks              = ["0.0.0.0/0"]
+  from_port                = 22
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.bastion.id
+  to_port                  = 22
+  type                     = "ingress"
+}
+
 data "aws_ami" "worker" {
   filter {
     name   = "name"
@@ -334,10 +369,10 @@ resource "aws_eks_node_group" "worker" {
   // Worker Settings
   instance_types = ["t3.small"]
   disk_size      = 20
-  capacity_type = "ON_DEMAND" #OR SPOT
+  capacity_type = "SPOT" #OR SPOT
 
   scaling_config {
-    desired_size = 1
+    desired_size = 2
     min_size     = 1
     max_size     = 2
   }
@@ -354,16 +389,21 @@ resource "aws_eks_node_group" "worker" {
   ]
 }
 
-data "template_file" "aws-auth" {
-  template = file("${path.module}/templates/aws_auth.yaml.tpl")
+# data "template_file" "aws-auth" {
+#   template = file("${path.module}/templates/aws_auth.yaml.tpl")
 
-  vars = {
-    rolearn   = aws_iam_role.worker.arn
-  }
-}
+#   vars = {
+#     rolearn   = aws_iam_role.worker.arn
+#   }
+# }
 
 resource "local_file" "aws-auth" {
-  content  = data.template_file.aws-auth.rendered
+  content = templatefile("${path.module}/templates/aws_auth.yaml.tpl", 
+    { 
+        rolearn = aws_iam_role.worker.arn
+    }
+)
+  # content  = data.template_file.aws-auth.rendered
   filename = "${path.cwd}/.output/aws_auth.yaml"
 }
 
@@ -372,27 +412,29 @@ resource "local_file" "aws-auth" {
 data "aws_ami" "this" {
   most_recent = true
   owners      = ["amazon"]
-  filter {
-    name   = "architecture"
-    values = ["arm64"]
-  }
+#   filter {
+#     name   = "architecture"
+#     values = ["x86_64"]
+#   }
   filter {
     name   = "name"
-    values = ["al2023-ami-2023*"]
+    values = ["al2023-ami-2023.*-x86_64"]
   }
 }
 
 resource "aws_instance" "bastion" {
+  security_groups = [aws_security_group.bastion.id]
+  key_name = "keypair-DevCollie"
   ami = data.aws_ami.this.id
-  instance_market_options {
-    market_type = "spot"
-    spot_options {
-      max_price = 0.0031
-    }
-  }
+#   instance_market_options {
+#     market_type = "spot"
+#     spot_options {
+#       max_price = 0.0031
+#     }
+#   }
 
   subnet_id = aws_subnet.public[0].id
-  instance_type = "t4g.nano"
+  instance_type = "t3.nano"
   tags = {
     Name = "test-spot"
   }
@@ -445,10 +487,10 @@ resource "aws_db_parameter_group" "education" {
   }
 }
 
-variable "db_password" {
-  description = "RDS root user password"
-  sensitive   = true
-}
+# variable "db_password" {
+#   description = "RDS root user password"
+#   sensitive   = true
+# }
 
 resource "aws_db_instance" "education" {
   identifier             = "education"
@@ -457,11 +499,18 @@ resource "aws_db_instance" "education" {
   engine                 = "postgres"
   engine_version         = "16.1"
   username               = "edu"
-  password               = var.db_password
+  password               = "sample"
+  db_name                = "mywork"
   db_subnet_group_name   = aws_db_subnet_group.education.name
   vpc_security_group_ids = [aws_security_group.rds.id]
   parameter_group_name   = aws_db_parameter_group.education.name
   skip_final_snapshot    = true
+
+  lifecycle {
+    ignore_changes = [ 
+        "password"
+     ]
+  }
 }
 
 # TO-DO Cloudfront resource 
