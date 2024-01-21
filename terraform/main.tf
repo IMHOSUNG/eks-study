@@ -235,7 +235,7 @@ resource "aws_security_group_rule" "eks_data_plane_ingress_dataplane" {
     
     source_security_group_id = aws_security_group.eks_data_plane.id
     from_port = 0
-    to_port = 0
+    to_port = 65535
     protocol = "-1"
     type = "ingress"
 }
@@ -257,7 +257,7 @@ resource "aws_security_group_rule" "eks_data_plane_egress_cluster" {
     
     cidr_blocks = ["0.0.0.0/0"]
     from_port = 0
-    to_port = 0
+    to_port = 65535
     protocol = "tcp"
     type = "egress"
 }
@@ -348,7 +348,7 @@ resource "aws_security_group_rule" "bastion_egress" {
   from_port                = 0
   protocol                 = "-1"
   security_group_id        = aws_security_group.bastion.id
-  to_port                  = 0
+  to_port                  = 65535
   type                     = "egress"
 }
 
@@ -438,40 +438,50 @@ resource "aws_eip" "ec2" {
   instance = aws_instance.bastion.id
 }
 
-resource "aws_db_subnet_group" "education" {
-  name       = "education"
+resource "aws_db_subnet_group" "rds" {
+  name       = format("%s_db_subnet_group",lower(local.owner))
   subnet_ids = aws_subnet.private_db[*].id
 
   tags = {
-    Name = "Education"
+    Name = format("%s_DB_Subnet_Group",local.owner)
   }
 }
 
 resource "aws_security_group" "rds" {
-  name   = "education_rds"
+  name   = format("%s_DB_SG",local.owner)
   vpc_id = aws_vpc.this.id
 
-  ingress {
-    from_port   = 5432
-    to_port     = 5432
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 5432
-    to_port     = 5432
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
   tags = {
-    Name = "education_rds"
+    Name = format("%s_DB_SG",local.owner)
   }
 }
 
-resource "aws_db_parameter_group" "education" {
-  name   = "education"
+resource "aws_security_group_rule" "rds_ingress" {
+  description = "postgresql rds ingress rule"
+  
+  security_group_id = aws_security_group.rds.id
+  from_port = 0
+  to_port = 65535
+  cidr_blocks = ["0.0.0.0/0"]
+  protocol = "tcp"
+  type = "ingress"
+}
+
+resource "aws_security_group_rule" "rds_egress" {
+  description = "postgresql rds egress rule"
+  
+  security_group_id = aws_security_group.rds.id
+  from_port = 0
+  to_port = 65535
+  cidr_blocks = ["0.0.0.0/0"]
+  protocol = "tcp"
+  type = "egress"
+}
+
+# db 파라미터 및 db 서브넷 그룹 이름명은 알파벳 소문자로 작성해야 함
+# only lowercase alphanumeric characters, periods, and hyphens allowed in parameter group "name"
+resource "aws_db_parameter_group" "rds" {
+  name   = format("%s-db-paramgroup",lower(local.owner))
   family = "postgres16"
 
   parameter {
@@ -480,31 +490,33 @@ resource "aws_db_parameter_group" "education" {
   }
 }
 
+# Sensitive 한 값을 실행 시 입력 받을 수 있게 처리하는 방법
 # variable "db_password" {
 #   description = "RDS root user password"
 #   sensitive   = true
 # }
 
-# resource "aws_db_instance" "education" {
-#   identifier             = "education"
-#   instance_class         = "db.t3.micro"
-#   allocated_storage      = 5
-#   engine                 = "postgres"
-#   engine_version         = "16.1"
-#   username               = "edu"
-#   password               = "sampletestpassword"
-#   db_name                = "mywork"
-#   db_subnet_group_name   = aws_db_subnet_group.education.name
-#   vpc_security_group_ids = [aws_security_group.rds.id]
-#   parameter_group_name   = aws_db_parameter_group.education.name
-#   skip_final_snapshot    = true
+# db 이름은 소문자 및 하이픈만 가능
+resource "aws_db_instance" "rds" {
+  identifier             = "collie-rds"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 5
+  engine                 = "postgres"
+  engine_version         = "16.1"
+  username               = "collie"
+  password               = "colliesample"
+  db_name                = "mywork"
+  db_subnet_group_name   = aws_db_subnet_group.rds.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  parameter_group_name   = aws_db_parameter_group.rds.name
+  skip_final_snapshot    = true
 
-#   lifecycle {
-#     ignore_changes = [ 
-#         password
-#      ]
-#   }
-# }
+  lifecycle {
+    ignore_changes = [ 
+        password
+     ]
+  }
+}
 
 # TO-DO Cloudfront resource 
 #https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudfront_distribution
