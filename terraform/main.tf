@@ -1,39 +1,6 @@
-# kubectl install
-# tfenv use 1.5.6
-# terraform init
-# 
-
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
-
+# Set Local Variable
 locals {
-    owner = "Collie"
-}
-
-variable "public_cidr" {
-    type = string
-    default = "192.168.0.0/16"
-}
-
-variable "azs" {
-    type = list(string)
-    default = ["ap-northeast-2a", "ap-northeast-2b", "ap-northeast-2c"]
-}
-
-variable "public_subnet" {
-    type = list(string)
-    default = ["192.168.0.0/24","192.168.1.0/24","192.168.2.0/24"]
-}
-
-variable "private_subnet" {
-    type = list(string)
-    default = ["192.168.10.0/24","192.168.11.0/24","192.168.12.0/24"]
+    owner = title("Collie")
 }
 
 # Configure the AWS Provider
@@ -42,15 +9,17 @@ provider "aws" {
     region = "ap-northeast-2"
 }
 
-# Create a VPC
+##############
+# VPC
+##############
 resource "aws_vpc" "this" {
     cidr_block = var.public_cidr
     tags = {
-        Name = format("%s_%s",local.owner,"vpc")
+        Name = format("%s_%s",local.owner,title("vpc"))
     }
 }
 
-# make for_each later
+# Subnet-Public
 resource "aws_subnet" "public" {
     count = length(var.public_subnet)
     vpc_id = aws_vpc.this.id
@@ -58,44 +27,62 @@ resource "aws_subnet" "public" {
     availability_zone = var.azs[count.index]
     map_public_ip_on_launch = true
     tags = {
-        Name = format("%s_%s_%s",local.owner,"PublicSubnet",count.index)
+        Name = format("%s_%s_Subnet_%s",local.owner,"Public",count.index+1)
     }
 }
 
-resource "aws_subnet" "private" {
-    count = length(var.private_subnet)
+# Subnet-Private
+resource "aws_subnet" "private_eks" {
+    count = length(var.private_eks_subnet)
     vpc_id = aws_vpc.this.id
-    cidr_block = var.private_subnet[count.index]
+    cidr_block = var.private_eks_subnet[count.index]
     availability_zone = var.azs[count.index]
     
     tags = {
-        Name = format("%s_%s_%s",local.owner,"PrivateSubnet",count.index)
+        Name = format("%s_%s_Subnet_%s",local.owner,"Private",count.index+1)
     }
 }
 
+resource "aws_subnet" "private_db" {
+    count = length(var.private_db_subnet)
+    vpc_id = aws_vpc.this.id
+    cidr_block = var.private_db_subnet[count.index]
+    availability_zone = var.azs[count.index]
+    
+    tags = {
+        Name = format("%s_%s_Subnet_%s",local.owner,"Private",count.index+1)
+    }
+}
+
+# InternetGW
 resource "aws_internet_gateway" "this" {
     vpc_id = aws_vpc.this.id 
     tags = { 
-        Name = format("%s_%s",local.owner,"igw")
+        Name = format("%s_IGW",local.owner)
     }  
 }
 
+# NATGW_Single
+resource "aws_eip" "nat_gw" {
+    domain = "vpc"
 
-resource "aws_eip" "nat_ip" {
-  domain = "vpc"
+    tags = { 
+        Name = format("%s_NAT_EIP",local.owner)
+    }  
 }
 
-resource "aws_nat_gateway" "this" {
-  allocation_id = aws_eip.nat_ip.id
+resource "aws_nat_gateway" "single" {
+  allocation_id = aws_eip.nat_gw.id
   subnet_id     = aws_subnet.public[0].id
 
   tags = {
-    Name = "gw NAT"
+    Name = format("%s_%s",local.owner,"natgw")
   }
 
   depends_on = [aws_internet_gateway.this]
 }
 
+# RouteTable-Public
 resource "aws_route_table" "public" {
     vpc_id = aws_vpc.this.id
 
@@ -109,50 +96,65 @@ resource "aws_route_table" "public" {
     }
 }
 
-resource "aws_route_table" "private" {
-    vpc_id = aws_vpc.this.id
-
-    route {
-        cidr_block = "0.0.0.0/0"
-        nat_gateway_id = aws_nat_gateway.this.id
-    }
-
-    tags = {
-        Name = format("%s_%s",local.owner,"PrivateRT")
-    }
-}
-
 resource "aws_route_table_association" "public" {
     count = length(var.public_subnet)
     subnet_id = aws_subnet.public[count.index].id
     route_table_id = aws_route_table.public.id
 }
 
-resource "aws_route_table_association" "private" {
-    count = length(var.private_subnet)
-    subnet_id = aws_subnet.private[count.index].id
+# RouteTable-Private
+resource "aws_route_table" "private" {
+    vpc_id = aws_vpc.this.id
+
+    route {
+        cidr_block = "0.0.0.0/0"
+        nat_gateway_id = aws_nat_gateway.single.id
+    }
+
+    tags = {
+        Name = format("%s_Private_RT",local.owner)
+    }
+}
+
+resource "aws_route_table_association" "private_eks" {
+    count = length(var.private_eks_subnet)
+    subnet_id = aws_subnet.private_eks[count.index].id
     route_table_id = aws_route_table.private.id
 }
 
-resource "aws_security_group" "eks" {
-	name = "kuberkuber-eks"
-	description = "Cluster communication with worker nodes"
-	vpc_id = aws_vpc.this.id
+resource "aws_route_table_association" "private_db" {
+    count = length(var.private_db_subnet)
+    subnet_id = aws_subnet.private_db[count.index].id
+    route_table_id = aws_route_table.private.id
+}
 
-	egress {
-		from_port = 0
-		to_port = 0
-		protocol = "-1"
-		cidr_blocks = ["0.0.0.0/0"]
-	}
+##############
+# EKS
+##############
+resource "aws_eks_cluster" "this" {
+    name = format("%s_%s",local.owner,"EKS")
+    role_arn = aws_iam_role.eks.arn
 
-	tags = {
-		Name = "kuberkuber-eks"
-	}
+    vpc_config {
+        security_group_ids = [aws_security_group.eks_control_plane.id,aws_security_group.eks_data_plane.id]
+		subnet_ids = aws_subnet.private_eks[*].id
+		endpoint_public_access = true
+		endpoint_private_access = true
+    }
+
+    depends_on = [ 		
+        aws_iam_role_policy_attachment.eks-cluster-EKSClusterPolicy,
+		aws_iam_role_policy_attachment.eks-cluster-EKSServicePolicy,
+        aws_iam_role_policy_attachment.cluster_AmazonEKSVPCResourceController, 
+    ]
+
+    tags = {
+        name = format("%s_%s",local.owner,"EKS")
+    }
 }
 
 resource "aws_iam_role" "eks" {
-	name = "kuberkuber-eks"
+	name = format("%s_EKS_Cluster_IAM",local.owner)
 
 	assume_role_policy = <<POLICY
 {
@@ -186,40 +188,91 @@ resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSVPCResourceControlle
   role       = aws_iam_role.eks.name
 }
 
-resource "aws_eks_cluster" "eks" {
-    name = format("%s_%s",local.owner,"EKS")
-    role_arn = aws_iam_role.eks.arn
-
-    vpc_config {
-        security_group_ids = [aws_security_group.eks.id]
-		subnet_ids = [aws_subnet.public[0].id,aws_subnet.public[1].id,aws_subnet.public[2].id]
-		endpoint_public_access = true
-		endpoint_private_access = true
-    }
-
-    depends_on = [ 		
-        aws_iam_role_policy_attachment.eks-cluster-EKSClusterPolicy,
-		aws_iam_role_policy_attachment.eks-cluster-EKSServicePolicy,
-        aws_iam_role_policy_attachment.cluster_AmazonEKSVPCResourceController, 
-    ]
+resource "aws_security_group" "eks_control_plane" {
+    name = format("%s_ControlPlane_SG",local.owner)
+	vpc_id = aws_vpc.this.id
+	description = "EKS ControlPlane Security Group"
+	tags = {
+		Name = format("%s_ControlPlane_SG",local.owner)
+	}    
 }
 
-# data "template_file" "kube-config" {
-# 	template = file("${path.module}/templates/kube_config.yaml.tpl")
+resource "aws_security_group_rule" "eks_control_plane_ingress" {
+    description = "Allow control plane api server from dataplane pod"
+    security_group_id = aws_security_group.eks_control_plane.id
+    
+    source_security_group_id = aws_security_group.eks_data_plane.id
+    from_port = 443
+    to_port = 443
+    protocol = "tcp"
+    type = "ingress"
+}
 
-	# vars = {
-	# 	CERTIFICATE = aws_eks_cluster.eks.certificate_authority[0].data
-	# 	MASTER_ENDPOINT = aws_eks_cluster.eks.endpoint
-	# 	CLUSTER_NAME = format("%s_%s",local.owner,"EKS")
-	# 	ROLE_ARN = aws_iam_role.eks.arn
-	# }
-# }
+resource "aws_security_group_rule" "eks_control_plane_egress" {
+    description = "Allow control plane api server to dataplane pod"
+    security_group_id = aws_security_group.eks_control_plane.id
+    
+    source_security_group_id = aws_security_group.eks_data_plane.id
+    from_port = 1024
+    to_port = 65535
+    protocol =  "tcp"
+    type = "egress"
+}
+
+resource "aws_security_group" "eks_data_plane" {
+  name = format("%s_DataPlane_SG",local.owner)
+  vpc_id      = aws_vpc.this.id
+  description = "EKS DataPlane Security Group"
+
+  tags = {
+    Name = format("%s_DataPlane_SG",local.owner)
+  }
+}
+
+resource "aws_security_group_rule" "eks_data_plane_ingress_dataplane" {
+    description = "Allow data plane communicate with each other"
+    security_group_id = aws_security_group.eks_data_plane.id
+    
+    source_security_group_id = aws_security_group.eks_data_plane.id
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    type = "ingress"
+}
+
+resource "aws_security_group_rule" "eks_data_plane_ingress_cluster" {
+    description = "Allow data plane communicate with each other"
+    security_group_id = aws_security_group.eks_data_plane.id
+    
+    source_security_group_id = aws_security_group.eks_control_plane.id
+    from_port = 1025
+    to_port = 65535
+    protocol = "tcp"
+    type = "ingress"
+}
+
+resource "aws_security_group_rule" "eks_data_plane_egress_cluster" {
+    description = "Allow data plane egress all"
+    security_group_id = aws_security_group.eks_data_plane.id
+    
+    cidr_blocks = ["0.0.0.0/0"]
+    from_port = 0
+    to_port = 0
+    protocol = "tcp"
+    type = "egress"
+}
+
+
+
+
+
+
 
 resource "local_file" "kube_config" {
  content = templatefile("${path.module}/templates/kube_config.yaml.tpl",
     {
-		CERTIFICATE = aws_eks_cluster.eks.certificate_authority[0].data
-		MASTER_ENDPOINT = aws_eks_cluster.eks.endpoint
+		CERTIFICATE = aws_eks_cluster.this.certificate_authority[0].data
+		MASTER_ENDPOINT = aws_eks_cluster.this.endpoint
 		CLUSTER_NAME = format("%s_%s",local.owner,"EKS")
 		ROLE_ARN = aws_iam_role.eks.arn
 	})
@@ -268,72 +321,18 @@ resource "aws_iam_instance_profile" "worker" {
 	role = aws_iam_role.worker.name
 }
 
-resource "aws_security_group" "worker" {
-  name        = "kuberkuber-worker"
-  description = "Security group for all nodes in the cluster"
-  vpc_id      = aws_vpc.this.id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    "Name" = "kuberkuber-worker"
-    "kubernetes.io/cluster/Collie_EKS" = "owned"
-  }
-}
-
-resource "aws_security_group_rule" "workers_ingress_self" {
-  description              = "Allow node to communicate with each other"
-  from_port                = 0
-  protocol                 = "-1"
-  security_group_id        = aws_security_group.worker.id
-  source_security_group_id = aws_security_group.worker.id
-  to_port                  = 65535
-  type                     = "ingress"
-}
-
-resource "aws_security_group_rule" "workers-ingress-cluster" {
-  description              = "Allow worker Kubelets and pods to receive communication from the cluster control plane"
-  from_port                = 1025
-  protocol                 = "tcp"
-  security_group_id        = aws_security_group.worker.id
-  source_security_group_id = aws_security_group.eks.id
-  to_port                  = 65535
-  type                     = "ingress"
-}
-
-resource "aws_security_group_rule" "eks_cluster_ingress_node_https" {
-  description              = "Allow pods running extension API servers on port 443 to receive communication from cluster control plane."
-  from_port                = 443
-  protocol                 = "tcp"
-  security_group_id        = aws_security_group.eks.id
-  source_security_group_id = aws_security_group.worker.id
-  to_port                  = 443
-  type                     = "ingress"
-}
 
 resource "aws_security_group" "bastion" {
   name        = "bastion"
   description = "bastion"
   vpc_id      = aws_vpc.this.id
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
   tags = {
     "Name" = "bastion"
   }
 }
 
-resource "aws_security_group_rule" "ssh" {
+resource "aws_security_group_rule" "bastion_ingress" {
   description              = "test"
   cidr_blocks              = ["0.0.0.0/0"]
   from_port                = 22
@@ -343,25 +342,27 @@ resource "aws_security_group_rule" "ssh" {
   type                     = "ingress"
 }
 
+resource "aws_security_group_rule" "bastion_egress" {
+  description              = "test"
+  cidr_blocks              = ["0.0.0.0/0"]
+  from_port                = 0
+  protocol                 = "-1"
+  security_group_id        = aws_security_group.bastion.id
+  to_port                  = 0
+  type                     = "egress"
+}
+
 data "aws_ami" "worker" {
   filter {
     name   = "name"
-    values = ["amazon-eks-node-${aws_eks_cluster.eks.version}-v*"]
+    values = ["amazon-eks-node-${aws_eks_cluster.this.version}-v*"]
   }
 
   most_recent = true
 }
 
-locals {
-  eks_worker_userdata = <<USERDATA
-#!/bin/bash
-set -o xtrace
-/etc/eks/bootstrap.sh --apiserver-endpoint '${aws_eks_cluster.eks.endpoint}' --b64-cluster-ca '${aws_eks_cluster.eks.certificate_authority[0].data}' Collie_EKS
-USERDATA
-}
-
 resource "aws_eks_node_group" "worker" {
-  cluster_name    = aws_eks_cluster.eks.name
+  cluster_name    = aws_eks_cluster.this.name
   node_group_name = "collie-worker-node"
   node_role_arn   = aws_iam_role.worker.arn
   subnet_ids      = [aws_subnet.public[0].id,aws_subnet.public[1].id,aws_subnet.public[2].id] // Network Configuration
@@ -378,7 +379,7 @@ resource "aws_eks_node_group" "worker" {
   }
 
   remote_access {
-    source_security_group_ids = [aws_security_group.worker.id]
+    source_security_group_ids = [aws_security_group.eks_data_plane.id]
     ec2_ssh_key               = "keypair-DevCollie"
   }
 
@@ -388,14 +389,6 @@ resource "aws_eks_node_group" "worker" {
     aws_iam_role_policy_attachment.eks-worker-AmazonEKSWorkerNodePolicy,
   ]
 }
-
-# data "template_file" "aws-auth" {
-#   template = file("${path.module}/templates/aws_auth.yaml.tpl")
-
-#   vars = {
-#     rolearn   = aws_iam_role.worker.arn
-#   }
-# }
 
 resource "local_file" "aws-auth" {
   content = templatefile("${path.module}/templates/aws_auth.yaml.tpl", 
@@ -423,7 +416,7 @@ data "aws_ami" "this" {
 }
 
 resource "aws_instance" "bastion" {
-  security_groups = [aws_security_group.bastion.id]
+  vpc_security_group_ids = [aws_security_group.bastion.id]
   key_name = "keypair-DevCollie"
   ami = data.aws_ami.this.id
 #   instance_market_options {
@@ -447,7 +440,7 @@ resource "aws_eip" "ec2" {
 
 resource "aws_db_subnet_group" "education" {
   name       = "education"
-  subnet_ids = aws_subnet.public[*].id
+  subnet_ids = aws_subnet.private_db[*].id
 
   tags = {
     Name = "Education"
@@ -492,26 +485,26 @@ resource "aws_db_parameter_group" "education" {
 #   sensitive   = true
 # }
 
-resource "aws_db_instance" "education" {
-  identifier             = "education"
-  instance_class         = "db.t3.micro"
-  allocated_storage      = 5
-  engine                 = "postgres"
-  engine_version         = "16.1"
-  username               = "edu"
-  password               = "sample"
-  db_name                = "mywork"
-  db_subnet_group_name   = aws_db_subnet_group.education.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  parameter_group_name   = aws_db_parameter_group.education.name
-  skip_final_snapshot    = true
+# resource "aws_db_instance" "education" {
+#   identifier             = "education"
+#   instance_class         = "db.t3.micro"
+#   allocated_storage      = 5
+#   engine                 = "postgres"
+#   engine_version         = "16.1"
+#   username               = "edu"
+#   password               = "sampletestpassword"
+#   db_name                = "mywork"
+#   db_subnet_group_name   = aws_db_subnet_group.education.name
+#   vpc_security_group_ids = [aws_security_group.rds.id]
+#   parameter_group_name   = aws_db_parameter_group.education.name
+#   skip_final_snapshot    = true
 
-  lifecycle {
-    ignore_changes = [ 
-        "password"
-     ]
-  }
-}
+#   lifecycle {
+#     ignore_changes = [ 
+#         password
+#      ]
+#   }
+# }
 
 # TO-DO Cloudfront resource 
 #https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudfront_distribution

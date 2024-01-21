@@ -1,10 +1,10 @@
 # Local .terraform directories
 **/.terraform/*
-
+**/.terraform.lock*
 # .tfstate files
 *.tfstate
 *.tfstate.*
-
+*.output*
 # Crash log files
 crash.log
 crash.*.log
@@ -32,3 +32,10 @@ override.tf.json
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
+
+# Ignore nuxt gradle build file
+**/node_modules/*
+**/dist/*
+**/.nuxt/*
+**/.gradle/*
+**/build/*
