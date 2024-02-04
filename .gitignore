@@ -1,3 +1,4 @@
+.DS_Store
 # Local .terraform directories
 **/.terraform/*
 **/.terraform.lock*
@@ -39,3 +40,6 @@ terraform.rc
 **/.nuxt/*
 **/.gradle/*
 **/build/*
+
+.envrc
+helm_values.yaml
